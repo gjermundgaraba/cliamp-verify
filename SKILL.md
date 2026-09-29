@@ -1,6 +1,7 @@
 ---
 name: verify-cliamp
 description: "Drive a real, isolated cliamp instance (the Bubbletea TUI in a private tmux server, or the --daemon headless mode) the way a user does, through keys, CLI subcommands, and IPC V2, and capture evidence. Use it to prove a UI, keybinding, playback, playlist, IPC, or daemon change works in the running app, not just in unit tests."
+disable-model-invocation: true
 ---
 
 # Verify cliamp

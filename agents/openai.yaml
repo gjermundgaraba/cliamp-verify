@@ -1,0 +1,7 @@
+interface:
+  display_name: "Verify cliamp"
+  short_description: "Drive an isolated cliamp instance and capture evidence"
+  default_prompt: "Use $verify-cliamp to prove this cliamp change works in the running app."
+
+policy:
+  allow_implicit_invocation: false
