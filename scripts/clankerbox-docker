@@ -1,7 +1,8 @@
 #!/bin/sh
 # clankerbox-docker: start Docker inside a clankerbox machine so `vc up --server NAME` works there.
-# Needs the cliamp-dev profile, which installs docker.io. Run as root in a login shell on a
-# disposable box. Idempotent; run it again after a restart.
+# Needs the cliamp-dev profile, which installs docker.io. Run as root in a login shell. Idempotent;
+# run it again after a restart. It takes over /var/lib/docker and deletes leftover containers and
+# volumes, so it refuses to run anywhere but a clankerbox machine.
 #
 # Three fixes over starting the daemons by hand:
 # - The root filesystem is an overlay, and overlay-on-overlay fails ("fstype: overlay ... invalid
@@ -15,6 +16,8 @@
 # There is no systemd: the daemons run under nohup, logs in /var/log/{containerd,dockerd}.log.
 set -eu
 umask 022
+# The clankerbox guest daemon writes the machine's ID here on every clankerbox machine.
+[ -s /var/lib/clankerbox/machine-id ] || { echo "clankerbox-docker: not a clankerbox machine; refusing to touch this host's Docker" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "clankerbox-docker: run as root" >&2; exit 1; }
 
 command -v dockerd >/dev/null || { echo "clankerbox-docker: no dockerd; use the cliamp-dev profile" >&2; exit 1; }
