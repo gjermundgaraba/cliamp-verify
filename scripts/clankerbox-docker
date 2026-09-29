@@ -1,0 +1,48 @@
+#!/bin/sh
+# clankerbox-docker: start Docker inside a clankerbox machine so `vc up --server NAME` works there.
+# Needs the cliamp-dev profile, which installs docker.io. Run as root in a login shell on a
+# disposable box. Idempotent; run it again after a restart.
+#
+# Three fixes over starting the daemons by hand:
+# - The root filesystem is an overlay, and overlay-on-overlay fails ("fstype: overlay ... invalid
+#   argument"). Docker and containerd get a loop-mounted ext4 image instead.
+# - Box shells run with umask 0077, so daemons started from them write image layers as 0700 and every
+#   non-root process in a container gets "Permission denied". The daemons start with umask 022.
+# - A machine stop doesn't flush the loop image, so a container or volume removed just before it
+#   can come back after the start. No vc run survives a stop, so leftovers are deleted: vc
+#   containers from disk before dockerd starts (a ghost container can't be removed through
+#   Docker), then every unused volume (a resurrected volume has lost its "anonymous" label).
+# There is no systemd: the daemons run under nohup, logs in /var/log/{containerd,dockerd}.log.
+set -eu
+umask 022
+[ "$(id -u)" = 0 ] || { echo "clankerbox-docker: run as root" >&2; exit 1; }
+
+command -v dockerd >/dev/null || { echo "clankerbox-docker: no dockerd; use the cliamp-dev profile" >&2; exit 1; }
+
+IMG=/srv-containers.img
+if ! mountpoint -q /var/lib/docker; then
+	[ -f $IMG ] || { truncate -s 6G $IMG && mkfs.ext4 -q -F $IMG; }
+	mkdir -p /mnt/ctr
+	mountpoint -q /mnt/ctr || mount -o loop $IMG /mnt/ctr
+	mkdir -p /mnt/ctr/docker /mnt/ctr/containerd /var/lib/docker /var/lib/containerd
+	mount --bind /mnt/ctr/docker /var/lib/docker
+	mount --bind /mnt/ctr/containerd /var/lib/containerd
+fi
+
+if ! docker info >/dev/null 2>&1; then
+	for c in /var/lib/docker/containers/*/config.v2.json; do
+		[ -f "$c" ] && jq -e '.Config.Labels["vc.run"]' "$c" >/dev/null 2>&1 && rm -rf "$(dirname "$c")"
+	done
+	pgrep -x containerd >/dev/null || { nohup containerd >/var/log/containerd.log 2>&1 & sleep 2; }
+	pgrep -x dockerd >/dev/null || nohup dockerd --containerd=/run/containerd/containerd.sock >/var/log/dockerd.log 2>&1 &
+	i=0
+	until docker info >/dev/null 2>&1; do
+		i=$((i + 1))
+		[ $i -gt 60 ] && { echo "clankerbox-docker: dockerd did not come up; see /var/log/dockerd.log" >&2; exit 1; }
+		sleep 1
+	done
+	docker volume prune -af >/dev/null
+fi
+docker run --rm --user 1000:1000 alpine:3 id >/dev/null ||
+	{ echo "clankerbox-docker: non-root container check failed (umask/storage)" >&2; exit 1; }
+echo "clankerbox-docker: ready ($(docker version --format '{{.Server.Version}}'), storage $(df -h /var/lib/docker | awk 'NR==2{print $4" free"}'))"

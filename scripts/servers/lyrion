@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# lyrion: a disposable Lyrion Music Server (LMS) for one vc run. See lib.sh for the contract.
+# cliamp reads the library over JSON-RPC (/jsonrpc.js) and downloads files from /music/<id>/download,
+# so no Squeezebox player is needed.
+# VC_LYRION_AUTH=password turns on LMS password protection (user "verify") to exercise cliamp's Basic auth.
+# shellcheck source=SCRIPTDIR/lib.sh
+source "$(dirname "$0")/lib.sh"
+
+IMAGE=lmscommunity/lyrionmusicserver:9.1.2
+USER_NAME=verify
+PASSWORD=verify-lyrion-pass
+
+# rpc JSON_ARRAY: one slim.request against the run's server; prints the .result object, fails on
+# an empty reply (LMS drops the connection while starting and on some errors) or a missing result.
+rpc() {
+	local auth=()
+	[ -s "$STATE/user" ] && auth=(-u "$(load user):$(load password)")
+	curl -fsS --max-time 10 "${auth[@]}" -H 'Content-Type: application/json' \
+		-d "{\"id\":1,\"method\":\"slim.request\",\"params\":[\"\",$1]}" \
+		"$URL/jsonrpc.js" 2>/dev/null | jq -ce '.result // empty'
+}
+
+wait_rpc() { wait_for "$1" rpc '["serverstatus",0,0]' || fail "LMS did not answer JSON-RPC within $1s; see: vc srv RUN lyrion logs"; }
+
+# song_url TITLE: the file:// URL LMS stores for the fixture track with that exact title.
+song_url() { rpc "[\"titles\",0,50,\"search:$1\",\"tags:u\"]" | jq -r --arg t "$1" '.titles_loop[] | select(.title == $t) | .url' | head -1; }
+
+scanned() {
+	[ "$(rpc '["rescan","?"]' | jq -r ._rescan)" = 0 ] &&
+		[ "$(rpc '["info","total","songs","?"]' | jq -r ._songs)" = "$(lib_tracks)" ]
+}
+
+srv_up() {
+	local t0 pl id t hash
+	t0=$(date +%s)
+	# /config and /playlist are anonymous volumes: LMS runs as squeezeboxserver, which cannot write
+	# bind-mounted host dirs, and `docker rm -v` removes anonymous volumes with the container.
+	ctr_run 9000 -v "$LIB/music:/music:ro" -v /config -v /playlist
+	wait_rpc 120
+	# LMS caches the playlist dir on first read, so the pref only takes effect after a restart.
+	rpc '["pref","playlistdir","/playlist"]' >/dev/null || fail "setting playlistdir failed"
+	docker restart "$CTR" >/dev/null || fail "docker restart failed"
+	wait_rpc 120
+	rpc '["rescan"]' >/dev/null || fail "rescan failed"
+	wait_for 120 scanned || fail "scan did not finish with every fixture track within 120s"
+	# An .m3u in the music folder isn't imported as a saved playlist, so build it from the file's titles.
+	pl=$(rpc "[\"playlists\",\"new\",\"name:$PLAYLIST\"]" | jq -r '.playlist_id // .overwritten_playlist_id // empty')
+	[ -n "$pl" ] || fail "creating the saved playlist failed"
+	while IFS= read -r t; do
+		id=$(song_url "$t")
+		[ -n "$id" ] || fail "fixture track '$t' is not in the library"
+		rpc "[\"playlists\",\"edit\",\"cmd:add\",\"playlist_id:$pl\",\"url:$id\"]" >/dev/null || fail "adding '$t' to the playlist failed"
+	done < <(lib_playlist | jq -r '.[]')
+	save playlist_id "$pl"
+	if [ "${VC_LYRION_AUTH:-none}" = password ]; then
+		# LMS stores sha1_base64(password) and reads these prefs live, so no restart is needed.
+		hash=$(perl -MDigest::SHA=sha1_base64 -e 'print sha1_base64($ARGV[0])' "$PASSWORD")
+		if ! { rpc "[\"pref\",\"username\",\"$USER_NAME\"]" && rpc "[\"pref\",\"password\",\"$hash\"]" &&
+			rpc '["pref","authorize","1"]'; } >/dev/null; then
+			fail "enabling password protection failed"
+		fi
+		save user "$USER_NAME"
+		save password "$PASSWORD"
+		rpc '["serverstatus",0,0]' >/dev/null || fail "authenticated request failed after enabling auth"
+	fi
+	log "ready in $(($(date +%s) - t0))s: $(rpc '["info","total","songs","?"]' | jq -r ._songs) songs, saved playlist $pl"
+	printf '[lyrion]\nurl = "%s"\n' "$URL"
+	if [ -s "$STATE/user" ]; then printf 'user = "%s"\npassword = "%s"\n' "$(load user)" "$(load password)"; fi
+}
+
+srv_status() {
+	local songs
+	songs=$(rpc '["info","total","songs","?"]' | jq -r ._songs) || fail "no JSON-RPC answer at $URL"
+	echo "$URL songs=$songs playlist_id=$(load playlist_id)$([ -s "$STATE/user" ] && echo " login=$(load user):$(load password)")"
+}
+
+srv_main "$@"

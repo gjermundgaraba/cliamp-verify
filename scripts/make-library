@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# make-library DIR: generate the tagged fixture library that media servers index.
+# Layout (7 music tracks, 3 albums, 2 artists, 1 playlist, 1 audiobook, 1 podcast show):
+#   DIR/music/Verify Artist/Verify Album (2024)/0{1,2,3} - Tone {1,2,3}.mp3     Electronic, cover.jpg
+#   DIR/music/Verify Artist/Second Album (2025)/0{1,2} - Chord {1,2}.flac      Ambient, cover.jpg
+#   DIR/music/Other Artist/Other Album (2023)/0{1,2} - Pulse {1,2}.mp3         Rock, no cover
+#   DIR/music/Verify Playlist.m3u                                              Tone 2, Chord 1
+#   DIR/audiobooks/Verify Author/Verify Book/0{1,2} - Chapter {1,2}.mp3
+#   DIR/podcasts/Verify Show/0{1,2} - Episode {1,2}.mp3                         45 s, Verify Host
+# Tracks are 60 s sines; titles, artists, album artists, years, genres and track numbers are tagged.
+set -eo pipefail
+# Containers read these files as non-root users; clankerbox shells default to umask 0077.
+umask 022
+dir=${1:?usage: make-library DIR}
+command -v ffmpeg >/dev/null || { echo "make-library: missing ffmpeg" >&2; exit 1; }
+
+# tone OUT FREQ TITLE ARTIST ALBUM YEAR GENRE TRACK TOTAL
+tone() {
+	ffmpeg -nostdin -loglevel error -y -f lavfi -i "sine=frequency=$2:duration=60" \
+		-metadata title="$3" -metadata artist="$4" -metadata album_artist="$4" \
+		-metadata album="$5" -metadata date="$6" -metadata genre="$7" \
+		-metadata track="$8/$9" "$1"
+}
+cover() { ffmpeg -nostdin -loglevel error -y -f lavfi -i "color=c=$2:s=300x300" -frames:v 1 "$1"; }
+
+a1="$dir/music/Verify Artist/Verify Album (2024)"
+a2="$dir/music/Verify Artist/Second Album (2025)"
+a3="$dir/music/Other Artist/Other Album (2023)"
+bk="$dir/audiobooks/Verify Author/Verify Book"
+pc="$dir/podcasts/Verify Show"
+mkdir -p "$a1" "$a2" "$a3" "$bk" "$pc"
+
+for i in 1 2 3; do
+	tone "$a1/0$i - Tone $i.mp3" $((220 * i)) "Tone $i" "Verify Artist" "Verify Album" 2024 Electronic $i 3
+done
+for i in 1 2; do
+	tone "$a2/0$i - Chord $i.flac" $((330 * i)) "Chord $i" "Verify Artist" "Second Album" 2025 Ambient $i 2
+	tone "$a3/0$i - Pulse $i.mp3" $((440 * i)) "Pulse $i" "Other Artist" "Other Album" 2023 Rock $i 2
+	tone "$bk/0$i - Chapter $i.mp3" $((150 * i)) "Chapter $i" "Verify Author" "Verify Book" 2022 Audiobook $i 2
+	ffmpeg -nostdin -loglevel error -y -f lavfi -i "sine=frequency=$((500 + 100 * i)):duration=45" \
+		-metadata title="Episode $i" -metadata artist="Verify Host" -metadata album="Verify Show" \
+		-metadata date="2026-0$i-01" -metadata genre=Podcast -metadata track=$i "$pc/0$i - Episode $i.mp3"
+done
+cover "$a1/cover.jpg" navy
+cover "$a2/cover.jpg" darkgreen
+printf '#EXTM3U\n%s\n%s\n' "Verify Artist/Verify Album (2024)/02 - Tone 2.mp3" \
+	"Verify Artist/Second Album (2025)/01 - Chord 1.flac" >"$dir/music/Verify Playlist.m3u"

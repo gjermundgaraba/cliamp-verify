@@ -1,0 +1,541 @@
+#!/usr/bin/env bash
+# vc: launch, drive, observe, and tear down an isolated cliamp instance for verification.
+# Each run gets its own binary, HOME/config dir, IPC socket, fixtures, and private tmux server.
+set -eo pipefail
+
+ROOT=${VC_ROOT:-/tmp}
+ARTIFACTS_ROOT=${VC_ARTIFACTS:-/tmp/verify-cliamp-artifacts}
+# Verification-only provider credentials. Never the user's real ~/.config/cliamp.
+SECRETS=${VC_SECRETS:-$HOME/.config/cliamp-verify}
+SERVERS=$(cd "$(dirname "$0")" && pwd)/servers
+
+die() { echo "vc: $*" >&2; exit 1; }
+# is_server NAME: NAME is a server script in scripts/servers (not a path, not lib.sh).
+is_server() { case $1 in "" | */*) return 1 ;; esac; [ -f "$SERVERS/$1" ] && [ -x "$SERVERS/$1" ]; }
+
+usage() {
+	cat <<'EOF'
+usage:
+  vc up [--daemon] [--empty] [--null-audio] [--spotify] [--server NAME]... [--size WxH] [-- cliamp args...]
+                                       build the cliamp checkout you're in + launch; prints RUN id (--null-audio: per-run PulseAudio null sink, Linux,
+                                       automatic when there is no sound server or card;
+                                       --spotify: seed the verification Spotify credential from $VC_SECRETS;
+                                       --server: start a disposable media server (scripts/servers/NAME) on the
+                                       fixture library and configure cliamp for it)
+  vc srv RUN NAME status|logs          run a server script's subcommand against this run
+  vc doctor RUN                        read-only health check (exit 1 on FAIL)
+  vc keys RUN KEY...                   send tmux keys one at a time (Space, Enter, Escape, Down, C-f, q, ...)
+  vc type RUN TEXT                     type literal text
+  vc screen RUN [LABEL]                print the pane; with LABEL also save ARTIFACTS/RUN/LABEL.txt
+  vc wait-screen RUN REGEX [SECS]      wait until the pane matches an extended regex (default 5s)
+  vc cli RUN [--save LABEL] -- ARGS... run the cliamp client against this run's socket and config
+  vc events RUN SECS LABEL TOPIC...    subscribe for SECS seconds, save ARTIFACTS/RUN/LABEL.ndjson, print it
+  vc state RUN [JQ]                    print the V2 snapshot (default filter: .snapshot)
+  vc wait-state RUN JQ_BOOL [SECS]     wait until `.snapshot | JQ_BOOL` is true (default 5s)
+  vc files RUN [RELPATH]               list the isolated config dir, or print one file in it
+  vc save RUN SRC_RELPATH LABEL        copy a config-dir file into artifacts as LABEL
+  vc restart RUN                       quit cliamp (Ctrl+C) and relaunch it with the same args and config dir
+  vc ls                                list runs under $VC_ROOT
+  vc down RUN                          quit cliamp, kill this run's tmux server, delete scratch; keeps artifacts
+EOF
+}
+
+load_run() {
+	[ -n "$1" ] || die "missing RUN id (did vc up fail?)"
+	case $1 in *[!0-9]*) die "'$1' is not a RUN id; RUN is probably empty because vc up failed" ;; esac
+	ID=$1
+	RUN=$ROOT/vc-$ID
+	[ -d "$RUN" ] || die "no run $ID at $RUN (see: vc ls)"
+	H=$RUN/home
+	CFG=$H/.config/cliamp
+	ART=$ARTIFACTS_ROOT/$ID
+	REPO=$(cat "$RUN/repo")
+	set_iso
+}
+
+tm() { tmux -L "vc-$ID" "$@"; }
+
+# with_timeout SECS CMD...: SIGALRM survives exec, so CMD dies after SECS (macOS has no timeout(1)).
+with_timeout() { perl -e 'alarm shift; exec @ARGV or die "exec: $!\n"' "$@"; }
+
+# Every cliamp process gets the isolated environment. XDG_CONFIG_HOME must be
+# overridden too: it takes precedence over HOME and is set in many user shells.
+set_iso() {
+	ISO=("HOME=$H" "CLIAMP_CONFIG_DIR=$CFG" "XDG_CONFIG_HOME=$H/.config"
+		"XDG_DATA_HOME=$H/.local/share" "XDG_CACHE_HOME=$H/.cache")
+	# pactl (cliamp device) finds the run's null sink through PULSE_SERVER.
+	if [ -f "$RUN/null-audio" ]; then ISO+=("PULSE_SERVER=unix:$RUN/pulse.sock"); fi
+}
+
+# Linux: is there a sound server (PulseAudio or PipeWire) or an ALSA card to play into?
+has_audio_output() {
+	local rt=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+	if [ -n "${PULSE_SERVER:-}" ] || [ -S "$rt/pulse/native" ] || [ -S "$rt/pipewire-0" ]; then return 0; fi
+	[ -r /proc/asound/cards ] && ! grep -q 'no soundcards' /proc/asound/cards
+}
+
+iso() { env "${ISO[@]}" "$@"; }
+
+fingerprint() {
+	{
+		git -C "$REPO" rev-parse HEAD
+		git -C "$REPO" diff HEAD -- '*.go' go.mod go.sum
+		git -C "$REPO" ls-files --others --exclude-standard -- '*.go' | while read -r f; do cat "$REPO/$f"; done
+	} | shasum | cut -d' ' -f1
+}
+
+# One Spotify run at a time: all runs share one verification credential, whose
+# refresh token rotates on every launch.
+spotify_lock() {
+	mkdir -p "$SECRETS" && chmod 700 "$SECRETS"
+	local lock=$SECRETS/spotify.lock other
+	if [ -f "$lock" ]; then
+		other=$(cat "$lock")
+		tmux -L "vc-$other" has-session -t app 2>/dev/null &&
+			die "the Spotify verification credential is in use by run $other; vc down $other first"
+		echo "vc: taking over stale Spotify lock from run $other" >&2
+	fi
+	echo "$ID" >"$lock"
+}
+
+spotify_seed() {
+	touch "$RUN/spotify"
+	if [ -f "$SECRETS/spotify_credentials.json" ]; then
+		install -m 600 "$SECRETS/spotify_credentials.json" "$CFG/spotify_credentials.json"
+		shasum <"$SECRETS/spotify_credentials.json" | cut -d' ' -f1 >"$RUN/spotify.seed"
+	else
+		: >"$RUN/spotify.seed"
+		echo "vc: no Spotify verification credential in $SECRETS yet: sign in inside this run (press S, then follow the prompt); vc down stores it" >&2
+	fi
+	# client_id is empty (built-in fallback) unless SPOTIFY_CLIENT_ID is set, from the
+	# environment or from $SECRETS/spotify_client_id.
+	if [ -z "${SPOTIFY_CLIENT_ID:-}" ] && [ -s "$SECRETS/spotify_client_id" ]; then
+		SPOTIFY_CLIENT_ID=$(tr -d '[:space:]' <"$SECRETS/spotify_client_id")
+	fi
+	echo "${SPOTIFY_CLIENT_ID:-}" >"$RUN/spotify.client_id"
+	# shellcheck disable=SC2016 # literal ${...}: cliamp interpolates it from the environment.
+	printf '[spotify]\nclient_id = "${SPOTIFY_CLIENT_ID}"\n' >>"$CFG/config.toml"
+}
+
+# Store the (rotated) run credential, scrub secrets from evidence, release the lock.
+spotify_finish() {
+	local store=$SECRETS/spotify_credentials.json run_creds=$CFG/spotify_credentials.json seed now="" v
+	seed=$(cat "$RUN/spotify.seed")
+	[ -f "$store" ] && now=$(shasum <"$store" | cut -d' ' -f1)
+	for v in $(jq -r '.refresh_token // empty, .data // empty' "$run_creds" "$store" 2>/dev/null | sort -u); do
+		# shellcheck disable=SC2016 # perl, not the shell, expands $ENV{V}.
+		find "$ART" -type f -exec env V="$v" perl -pi -e 's/\Q$ENV{V}\E/[REDACTED]/g' {} +
+	done
+	if [ -f "$run_creds" ]; then
+		if [ "$now" = "$seed" ]; then
+			install -m 600 "$run_creds" "$store.tmp" && mv "$store.tmp" "$store"
+			echo "vc: saved the Spotify verification credential to $store"
+		else
+			echo "vc: WARNING: $store changed while run $ID was live; kept it and discarded this run's credential" >&2
+		fi
+	elif [ -n "$seed" ]; then
+		rm -f "$store"
+		echo "vc: cliamp rejected and removed the Spotify credential (dead refresh token); sign in again: vc up --spotify, press S" >&2
+	fi
+	[ "$(cat "$SECRETS/spotify.lock" 2>/dev/null)" = "$ID" ] && rm -f "$SECRETS/spotify.lock"
+	return 0
+}
+
+cmd_up() {
+	local daemon=0 music=1 null_audio=0 spotify=0 size=120x40 servers=() s
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--server)
+			is_server "${2:-}" || die "unknown server '${2:-}'; available: $(cd "$SERVERS" && find . -type f -perm -u+x | sed 's|^\./||' | sort | tr '\n' ' ')"
+			[[ " ${servers[*]} " == *" $2 "* ]] && die "--server $2 given twice"
+			servers+=("$2"); shift ;;
+		--daemon) daemon=1 ;;
+		--null-audio) null_audio=1 ;;
+		--spotify) spotify=1 ;;
+		--empty) music=0 ;;
+		--size) size=$2; shift ;;
+		--) shift; break ;;
+		*) die "unknown up flag: $1" ;;
+		esac
+		shift
+	done
+	for bin in go tmux ffmpeg jq git shasum; do
+		command -v "$bin" >/dev/null || die "missing dependency: $bin"
+	done
+	# The run builds the checkout vc up runs in, and records it for the other commands.
+	REPO=$(git rev-parse --show-toplevel 2>/dev/null) || REPO=
+	grep -qx 'module github.com/bjarneo/cliamp' "$REPO/go.mod" 2>/dev/null || die "run vc up from inside a cliamp checkout"
+	if [ ${#servers[@]} -gt 0 ]; then
+		docker info >/dev/null 2>&1 || die "--server needs a running Docker (on clankerbox: sh scripts/clankerbox-docker)"
+	fi
+
+	if [ $null_audio = 0 ] && [ "$(uname -s)" = Linux ] && ! has_audio_output; then
+		echo "vc: no sound server or card; playing into a per-run null sink" >&2
+		null_audio=1
+	fi
+	if [ $null_audio = 1 ]; then
+		[ "$(uname -s)" = Linux ] || die "--null-audio is Linux-only"
+		{ command -v pulseaudio && command -v pacat; } >/dev/null ||
+			die "a null sink needs pulseaudio, pactl/pacat and the ALSA pulse plugin (Debian/Ubuntu: pulseaudio pulseaudio-utils libasound2-plugins)"
+	fi
+
+	ID=$(date +%H%M%S)$((RANDOM % 1000))
+	RUN=$ROOT/vc-$ID
+	H=$RUN/home
+	CFG=$H/.config/cliamp
+	ART=$ARTIFACTS_ROOT/$ID
+	set_iso
+	case $CFG in "$RUN"/*) ;; *) die "isolation guard: config dir $CFG is outside $RUN" ;; esac
+	[ $spotify = 1 ] && spotify_lock
+	mkdir -p "$CFG" "$RUN/music" "$ART"
+	echo "$REPO" >"$RUN/repo"
+	[ $spotify = 1 ] && spotify_seed
+
+	local version
+	version=$(git -C "$REPO" describe --tags --always --dirty)
+	echo "vc: building $version from $REPO" >&2
+	(cd "$REPO" && go build -trimpath -ldflags "-X main.version=$version" -o "$RUN/cliamp" .) ||
+		{ rm -rf "$RUN"; die "build failed"; }
+	echo "$version" >"$RUN/build-version"
+	fingerprint >"$RUN/build-fingerprint"
+
+	# Servers start after the build: a failed build then leaves nothing running, and on a small
+	# machine the build doesn't compete with a server for memory.
+	if [ ${#servers[@]} -gt 0 ]; then
+		"$(dirname "$0")/make-library" "$RUN/library" || { rm -rf "$RUN"; die "fixture library failed"; }
+		for s in "${servers[@]}"; do
+			echo "$s" >>"$RUN/servers"
+			echo "vc: starting server $s" >&2
+			printf '\n' >>"$CFG/config.toml"
+			if ! "$SERVERS/$s" up "$RUN" >>"$CFG/config.toml"; then
+				stop_servers
+				rm -rf "$RUN"
+				die "server $s failed to start (see above)"
+			fi
+		done
+	fi
+
+	local i
+	for i in 1 2 3; do
+		ffmpeg -nostdin -loglevel error -f lavfi -i "sine=frequency=$((220 * i)):duration=120" \
+			-metadata title="Tone $i" -metadata artist="Verify Artist" \
+			-metadata album="Verify Album" -metadata track=$i "$RUN/music/0$i-tone-$i.mp3"
+	done
+
+	local args=(--vol -30)
+	[ $daemon = 1 ] && args=(--daemon "${args[@]}")
+	[ $music = 1 ] && args+=("$RUN/music")
+	args+=("$@")
+	if [ $daemon = 1 ]; then echo daemon >"$RUN/mode"; else echo tui >"$RUN/mode"; fi
+
+	# Private config: skip the user's tmux.conf and keep dead panes so crash output survives.
+	echo "set-option -g remain-on-exit on" >"$RUN/tmux.conf"
+	if [ $null_audio = 1 ]; then
+		# A PulseAudio null sink paces playback in real time (ALSA's null PCM does not).
+		# It runs in this run's tmux server, and ALSA reads $HOME/.asoundrc from the run's
+		# home, so nothing outside the run is touched.
+		local pa=$RUN/pulse.sock
+		printf 'pcm.!default { type pulse server "unix:%s" }\nctl.!default { type pulse server "unix:%s" }\n' "$pa" "$pa" >"$H/.asoundrc"
+		tm -f "$RUN/tmux.conf" new-session -d -s audio "exec env HOME=$(printf %q "$H") pulseaudio -n --daemonize=no --exit-idle-time=-1 --use-pid-file=no --disallow-exit -L module-null-sink -L $(printf %q "module-native-protocol-unix auth-anonymous=1 socket=$pa")"
+		for i in $(seq 1 40); do [ -S "$pa" ] && break; sleep 0.25; done
+		[ -S "$pa" ] || die "PulseAudio null sink did not start; inspect with: tmux -L vc-$ID capture-pane -p -t audio; clean up with: vc down $ID"
+		# Alone, the null sink works in ~2 s blocks, so each new stream stalls up to 2 s
+		# before it starts. A silent low-latency stream keeps it ticking in small blocks.
+		tm new-window -d -t audio "exec env HOME=$(printf %q "$H") PULSE_SERVER=unix:$(printf %q "$pa") pacat -p --raw --latency-msec=20 </dev/zero"
+		touch "$RUN/null-audio"
+		set_iso
+	fi
+	local cmd envs=("${ISO[@]}" TERM=xterm-256color)
+	[ $spotify = 1 ] && envs+=("SPOTIFY_CLIENT_ID=$(cat "$RUN/spotify.client_id")")
+	cmd="exec env $(printf '%q ' "${envs[@]}" "$RUN/cliamp" "${args[@]}")"
+	tm -f "$RUN/tmux.conf" new-session -d -s app -x "${size%x*}" -y "${size#*x}" "$cmd"
+
+	if wait_ready; then
+		echo "$ID"
+		cmd_doctor "$ID" >&2
+		return
+	fi
+	tm capture-pane -p -t app >"$ART/launch-failure.txt" 2>/dev/null || true
+	cat "$ART/launch-failure.txt" >&2 || true
+	die "run $ID never answered state.get within 15s; pane saved to $ART/launch-failure.txt; clean up with: vc down $ID"
+}
+
+# stop_servers: save each server's log to artifacts, then remove it. Safe to call twice.
+stop_servers() {
+	local s
+	[ -f "$RUN/servers" ] || return 0
+	mkdir -p "$ART"
+	while read -r s; do
+		"$SERVERS/$s" logs "$RUN" >"$ART/_server-$s.log" 2>&1 || true
+		"$SERVERS/$s" down "$RUN" || echo "vc: server $s did not stop cleanly" >&2
+	done <"$RUN/servers"
+}
+
+cmd_srv() {
+	load_run "$1"
+	is_server "${2:-}" || die "usage: vc srv RUN NAME status|logs"
+	case ${3:-} in status | logs) ;; *) die "usage: vc srv RUN NAME status|logs" ;; esac
+	"$SERVERS/$2" "$3" "$RUN"
+}
+
+cmd_doctor() {
+	load_run "$1"
+	local fail=0 dead status pid sockpid resp
+	note() { echo "doctor: $*"; }
+	bad() { echo "doctor: FAIL $*"; fail=1; }
+
+	note "run=$ID mode=$(cat "$RUN/mode") dir=$RUN"
+	if ! tm has-session -t app 2>/dev/null; then
+		bad "tmux session vc-$ID/app is gone"
+		return 1
+	fi
+	IFS='|' read -r dead pid status <<<"$(tm display-message -p -t app '#{pane_dead}|#{pane_pid}|#{pane_dead_status}')"
+	[ "$dead" = 1 ] && bad "cliamp exited (status $status); inspect with: vc screen $ID"
+	if [ -S "$CFG/cliamp.sock" ]; then
+		sockpid=$(cat "$CFG/cliamp.sock.pid" 2>/dev/null || true)
+		[ "$sockpid" = "$pid" ] || bad "socket owned by pid '$sockpid', not this run's pane pid $pid"
+	else
+		bad "no socket at $CFG/cliamp.sock"
+	fi
+	if [ -f "$RUN/null-audio" ]; then
+		[ "$(tm display-message -p -t audio '#{pane_dead}' 2>/dev/null)" = 0 ] && [ -S "$RUN/pulse.sock" ] ||
+			bad "PulseAudio null sink is not running (session vc-$ID/audio)"
+	fi
+	if [ -f "$RUN/spotify" ]; then
+		if [ ! -f "$CFG/spotify_credentials.json" ]; then
+			note "spotify: not signed in yet (press S in the TUI and follow the prompt)"
+		elif resp=$(with_timeout 20 env "${ISO[@]}" "$RUN/cliamp" remote call provider.playlists --params '{"provider":"spotify","limit":1}' --wait 2>&1) &&
+			echo "$resp" | jq -e '.job.state == "succeeded"' >/dev/null 2>&1; then
+			note "spotify: signed in, playlists reachable"
+		elif limited=$(grep 'web api rate-limited' "$CFG/cliamp.log" 2>/dev/null | tail -1) && [ -n "$limited" ]; then
+			bad "spotify: Web API rate-limited (${limited##*msg=}); the client ID has no quota left. Use your own: see SKILL.md, Spotify"
+		else
+			bad "spotify: provider.playlists failed or timed out: $(echo "$resp" | jq -c '.job.error // .' 2>/dev/null || echo "$resp")"
+		fi
+	fi
+	if [ -f "$RUN/servers" ]; then
+		local s pl
+		while read -r s; do
+			if ! resp=$("$SERVERS/$s" status "$RUN" 2>&1); then
+				bad "server $s is not answering: $resp"
+			elif pl=$(with_timeout 20 env "${ISO[@]}" "$RUN/cliamp" remote call provider.playlists --params "{\"provider\":\"$s\",\"limit\":5}" --wait 2>&1) &&
+				echo "$pl" | jq -e '.job.state == "succeeded"' >/dev/null 2>&1; then
+				note "server $s: $resp; cliamp sees $(echo "$pl" | jq -r '.job.result.total // (.job.result.playlists | length)') playlists"
+			else
+				bad "server $s: provider.playlists failed or timed out: $(echo "$pl" | jq -c '.job.error // .' 2>/dev/null || echo "$pl")"
+			fi
+		done <"$RUN/servers"
+	fi
+	[ "$(iso "$RUN/cliamp" --version)" = "cliamp version $(cat "$RUN/build-version")" ] || bad "binary version mismatch"
+	[ "$(fingerprint)" = "$(cat "$RUN/build-fingerprint")" ] ||
+		bad "Go sources changed since this binary was built; vc down $ID && vc up"
+	resp=$(iso "$RUN/cliamp" remote state 2>&1 || true)
+	if echo "$resp" | jq -e .ok >/dev/null 2>&1; then
+		note "pid=$pid socket=$CFG/cliamp.sock version=$(cat "$RUN/build-version")"
+		note "$(echo "$resp" | jq -c '.snapshot | {state, track: .track.title, total, volume}')"
+	else
+		bad "state.get failed: $resp"
+	fi
+	[ $fail = 0 ] && note OK
+	return $fail
+}
+
+cmd_keys() {
+	load_run "$1"; shift
+	local k
+	for k in "$@"; do
+		tm send-keys -t app "$k"
+		sleep "${VC_KEY_DELAY:-0.15}"
+	done
+}
+
+cmd_type() {
+	load_run "$1"; shift
+	tm send-keys -t app -l "$*"
+}
+
+cmd_screen() {
+	load_run "$1"
+	local out
+	out=$(tm capture-pane -p -t app)
+	if [ -n "$2" ]; then
+		mkdir -p "$(dirname "$ART/$2")"
+		printf '%s\n' "$out" >"$ART/$2.txt"
+		echo "vc: saved $ART/$2.txt" >&2
+	fi
+	printf '%s\n' "$out" | cat -s
+}
+
+cmd_wait_screen() {
+	load_run "$1"
+	local re=$2 secs=${3:-5} i
+	for i in $(seq 1 $((secs * 10))); do
+		tm capture-pane -p -t app | grep -Eq -- "$re" && return 0
+		sleep 0.1
+	done
+	tm capture-pane -p -t app | cat -s >&2
+	die "screen never matched /$re/ within ${secs}s"
+}
+
+cmd_cli() {
+	load_run "$1"; shift
+	local label=""
+	[ "$1" = --save ] && { label=$2; shift 2; }
+	[ "$1" = -- ] && shift
+	local out err code=0
+	out=$(mktemp) err=$(mktemp)
+	iso "$RUN/cliamp" "$@" >"$out" 2>"$err" || code=$?
+	cat "$out"
+	cat "$err" >&2
+	echo "vc: exit=$code" >&2
+	if [ -n "$label" ]; then
+		mkdir -p "$(dirname "$ART/$label")"
+		{
+			printf '$ cliamp'; printf ' %q' "$@"; printf '\n--- stdout\n'
+			cat "$out"; printf -- '--- stderr\n'; cat "$err"; printf -- '--- exit %s\n' "$code"
+		} >"$ART/$label.txt"
+		echo "vc: saved $ART/$label.txt" >&2
+	fi
+	rm -f "$out" "$err"
+	return $code
+}
+
+cmd_events() {
+	load_run "$1"
+	local secs=$2 label=$3 pid
+	shift 3
+	[ -n "$label" ] && [ $# -gt 0 ] || die "usage: vc events RUN SECS LABEL TOPIC..."
+	mkdir -p "$(dirname "$ART/$label")"
+	# exec so $! is the subscriber itself; killing a subshell would orphan it.
+	(exec env "${ISO[@]}" "$RUN/cliamp" remote events "$@") >"$ART/$label.ndjson" 2>&1 &
+	pid=$!
+	sleep "$secs"
+	kill "$pid" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+	cat "$ART/$label.ndjson"
+	echo "vc: saved $ART/$label.ndjson" >&2
+}
+
+cmd_state() {
+	load_run "$1"
+	iso "$RUN/cliamp" remote state | jq "${2:-.snapshot}"
+}
+
+cmd_wait_state() {
+	load_run "$1"
+	local expr=$2 secs=${3:-5} i
+	for i in $(seq 1 $((secs * 4))); do
+		iso "$RUN/cliamp" remote state 2>/dev/null | jq -e ".snapshot | $expr" >/dev/null 2>&1 && return 0
+		sleep 0.25
+	done
+	iso "$RUN/cliamp" remote state | jq -c .snapshot >&2
+	die "state never satisfied '$expr' within ${secs}s"
+}
+
+cmd_files() {
+	load_run "$1"
+	if [ -n "$2" ]; then
+		cat "$CFG/$2"
+	else
+		(cd "$CFG" && find . -type f ! -name cliamp.log | sort)
+	fi
+}
+
+cmd_save() {
+	load_run "$1"
+	mkdir -p "$(dirname "$ART/$3")"
+	cp "$CFG/$2" "$ART/$3"
+	echo "vc: saved $ART/$3" >&2
+}
+
+cmd_ls() {
+	local d id
+	for d in "$ROOT"/vc-*; do
+		[ -d "$d" ] || continue
+		id=${d##*/vc-}
+		if tmux -L "vc-$id" has-session -t app 2>/dev/null; then
+			echo "$id $(cat "$d/mode") alive"
+		else
+			echo "$id $(cat "$d/mode" 2>/dev/null) no-session"
+		fi
+	done
+}
+
+wait_ready() {
+	local i
+	for i in $(seq 1 60); do
+		iso "$RUN/cliamp" remote state 2>/dev/null | jq -e .ok >/dev/null 2>&1 && return 0
+		sleep 0.25
+	done
+	return 1
+}
+
+quit_pane() {
+	local i
+	[ "$(tm display-message -p -t app '#{pane_dead}')" = 1 ] && return 0
+	tm send-keys -t app C-c
+	for i in $(seq 1 50); do
+		[ "$(tm display-message -p -t app '#{pane_dead}')" = 1 ] && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
+cmd_restart() {
+	load_run "$1"
+	quit_pane || die "cliamp did not exit on Ctrl+C; inspect with: vc screen $ID"
+	tm display-message -p -t app 'pane_dead=#{pane_dead} exit_status=#{pane_dead_status}' >>"$ART/_restarts.txt"
+	tm respawn-pane -t app
+	wait_ready || die "run $ID did not answer state.get within 15s after restart"
+	cmd_doctor "$ID"
+}
+
+cmd_down() {
+	load_run "$1"
+	mkdir -p "$ART"
+	local i
+	if tm has-session -t app 2>/dev/null; then
+		tm capture-pane -p -t app >"$ART/_final-screen.txt" || true
+		quit_pane || true
+		tm display-message -p -t app 'pane_dead=#{pane_dead} exit_status=#{pane_dead_status}' >"$ART/_exit.txt" || true
+	fi
+	if tm has-session -t audio 2>/dev/null; then
+		# PulseAudio ignores the SIGHUP that kill-server sends, so stop it by pid.
+		kill "$(tm display-message -p -t audio '#{pane_pid}')" 2>/dev/null || true
+		for i in $(seq 1 30); do
+			[ "$(tm display-message -p -t audio '#{pane_dead}')" = 1 ] && break
+			sleep 0.1
+		done
+	fi
+	tm kill-server 2>/dev/null || true
+	cp "$CFG/cliamp.log" "$ART/_cliamp.log" 2>/dev/null || true
+	stop_servers
+	[ -f "$RUN/spotify" ] && spotify_finish
+	rm -rf "$RUN"
+	echo "vc: run $ID removed; artifacts kept at $ART:"
+	(cd "$ART" && find . -type f | sort)
+}
+
+sub=$1
+[ -n "$sub" ] || { usage; exit 1; }
+shift
+case $sub in
+up) cmd_up "$@" ;;
+doctor) cmd_doctor "$@" ;;
+keys) cmd_keys "$@" ;;
+type) cmd_type "$@" ;;
+screen) cmd_screen "$@" ;;
+wait-screen) cmd_wait_screen "$@" ;;
+cli) cmd_cli "$@" ;;
+events) cmd_events "$@" ;;
+state) cmd_state "$@" ;;
+wait-state) cmd_wait_state "$@" ;;
+files) cmd_files "$@" ;;
+save) cmd_save "$@" ;;
+ls) cmd_ls ;;
+restart) cmd_restart "$@" ;;
+down) cmd_down "$@" ;;
+srv) cmd_srv "$@" ;;
+-h | --help | help) usage ;;
+*) usage; exit 1 ;;
+esac

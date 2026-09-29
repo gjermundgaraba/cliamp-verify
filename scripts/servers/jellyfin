@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# jellyfin: a disposable Jellyfin server for one vc run (contract in lib.sh).
+# Bootstraps headlessly: startup wizard -> admin user -> music library on the fixture
+# library -> scan -> server-side playlist with the tracks of the fixture .m3u.
+# VC_JELLYFIN_AUTH=token configures cliamp with an API key instead of user/password.
+# shellcheck source=SCRIPTDIR/lib.sh
+source "$(dirname "$0")/lib.sh"
+
+IMAGE=jellyfin/jellyfin:12.1.20260915-010956
+USER_NAME=verify
+USER_PASS=verify-pass
+CLIENT='MediaBrowser Client="vc", Device="vc", DeviceId="vc-jellyfin", Version="1.0"'
+
+# api METHOD PATH [JSON]: call the server as the bootstrapped user (after login).
+api() {
+	local auth=$CLIENT
+	[ -s "$STATE/session" ] && auth="$CLIENT, Token=\"$(load session)\""
+	curl -fsS --max-time 20 -X "$1" -H "Authorization: $auth" -H 'Content-Type: application/json' \
+		${3:+-d "$3"} "$URL$2"
+}
+
+# ctype PATH: the response content type. While starting, the server answers API paths with an
+# HTML "server is starting" page, so a JSON content type means the API is really up.
+ctype() { curl -s -o /dev/null -w '%{content_type}' --max-time 3 "$URL$1"; }
+wizard_ready() { case $(ctype /Startup/Configuration) in application/json*) return 0 ;; esac; return 1; }
+api_ready() { case $(ctype /System/Info/Public) in application/json*) return 0 ;; esac; return 1; }
+
+audio_count() { api GET "/Items?userId=$(load user_id)&IncludeItemTypes=Audio&Recursive=true&Limit=0" | jq -r .TotalRecordCount; }
+scan_idle() { [ "$(api GET /ScheduledTasks | jq -r '.[] | select(.Key == "RefreshLibrary") | .State')" = Idle ]; }
+scanned() { [ "$(audio_count)" = "$(lib_tracks)" ] && scan_idle; }
+
+srv_up() {
+	ctr_run 8096 -v "$LIB/music:/music:ro"
+	SECONDS=0
+	wait_for 120 wizard_ready || fail "API did not come up within 120s (vc srv RUN jellyfin logs)"
+
+	# Startup wizard. GET /Startup/User creates the pending first user; POST names it.
+	api POST /Startup/Configuration '{"UICulture":"en-US","MetadataCountryCode":"US","PreferredMetadataLanguage":"en","ServerName":"vc"}' >/dev/null
+	api GET /Startup/User >/dev/null
+	api POST /Startup/User "{\"Name\":\"$USER_NAME\",\"Password\":\"$USER_PASS\"}" >/dev/null
+	api POST /Startup/RemoteAccess '{"EnableRemoteAccess":true}' >/dev/null
+	api POST /Startup/Complete >/dev/null
+
+	local auth
+	auth=$(api POST /Users/AuthenticateByName "{\"Username\":\"$USER_NAME\",\"Pw\":\"$USER_PASS\"}") ||
+		fail "login as $USER_NAME failed"
+	save session "$(jq -r .AccessToken <<<"$auth")"
+	save user_id "$(jq -r .User.Id <<<"$auth")"
+
+	api POST "/Library/VirtualFolders?name=Music&collectionType=music&paths=/music&refreshLibrary=true" '{"LibraryOptions":{}}' >/dev/null
+	wait_for 180 scanned || fail "library scan did not finish with $(lib_tracks) tracks within 180s (found $(audio_count))"
+
+	# Server-side playlist, in the .m3u's order.
+	local ids
+	ids=$(api GET "/Items?userId=$(load user_id)&IncludeItemTypes=Audio&Recursive=true" |
+		jq -c --argjson want "$(lib_playlist)" '[$want[] as $t | .Items[] | select(.Name == $t) | .Id]')
+	[ "$(jq length <<<"$ids")" = "$(lib_playlist | jq length)" ] || fail "not every $PLAYLIST track is in the library"
+	save playlist_id "$(api POST /Playlists "{\"Name\":\"$PLAYLIST\",\"Ids\":$ids,\"UserId\":\"$(load user_id)\",\"MediaType\":\"Audio\"}" | jq -r .Id)"
+
+	log "ready in ${SECONDS}s: $URL user=$USER_NAME password=$USER_PASS"
+	echo "[jellyfin]"
+	echo "url = \"$URL\""
+	if [ "${VC_JELLYFIN_AUTH:-password}" = token ]; then
+		api POST "/Auth/Keys?app=vc" >/dev/null
+		save api_key "$(api GET /Auth/Keys | jq -r '.Items[] | select(.AppName == "vc") | .AccessToken' | head -1)"
+		[ -n "$(load api_key)" ] || fail "could not create an API key"
+		echo "token = \"$(load api_key)\""
+	else
+		echo "user = \"$USER_NAME\""
+		echo "password = \"$USER_PASS\""
+	fi
+}
+
+srv_status() {
+	api_ready || fail "$URL is not answering"
+	echo "$URL user=$USER_NAME password=$USER_PASS user_id=$(load user_id)"
+}
+
+srv_main "$@"

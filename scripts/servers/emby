@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# emby: a disposable Emby server for one vc run (contract in lib.sh).
+# The first-run wizard, library and scan are driven through Emby's HTTP API; no Premiere needed.
+# shellcheck source=SCRIPTDIR/lib.sh
+source "$(dirname "$0")/lib.sh"
+
+IMAGE=emby/embyserver:4.10.0.40
+USER_NAME=verify
+USER_PASS=verify-pass
+AUTH='Emby UserId="", Client="vc", Device="vc", DeviceId="vc-verify", Version="1.0"'
+
+api() { # api METHOD PATH [curl args...]
+	local m=$1 p=$2; shift 2
+	curl -fsS --max-time 10 -X "$m" -H "X-Emby-Token: $(load token)" "$@" "$URL/emby$p"
+}
+
+# ready: every fixture track and album is indexed, every album has its year, and the imported
+# playlist holds the .m3u's tracks.
+ready() {
+	[ "$(api GET '/Items?Recursive=true&IncludeItemTypes=Audio' | jq .TotalRecordCount)" = "$(lib_tracks)" ] || return 1
+	api GET '/Items?Recursive=true&IncludeItemTypes=MusicAlbum&Fields=ProductionYear' |
+		jq -e --argjson n "$(lib_albums)" '.TotalRecordCount == $n and all(.Items[]; .ProductionYear != null)' >/dev/null || return 1
+	local pl
+	pl=$(api GET '/Items?Recursive=true&IncludeItemTypes=Playlist' | jq -r --arg n "$PLAYLIST" '.Items[] | select(.Name == $n) | .Id')
+	[ -n "$pl" ] && [ "$(api GET "/Playlists/$pl/Items" | jq '.Items | length')" = "$(lib_playlist | jq length)" ] && save playlist_id "$pl"
+}
+
+srv_up() {
+	local t0 json='Content-Type: application/json' tok
+	t0=$(date +%s)
+	ctr_run 8096 -v "$LIB/music:/music:ro"
+	wait_http "$URL/emby/System/Info/Public" 120 || fail "Emby did not answer within 120s (vc srv RUN emby logs)"
+
+	# First-run wizard: culture, first admin user, complete.
+	curl -fsS --max-time 10 -X POST -H "$json" -d '{"UICulture":"en-US","MetadataCountryCode":"US","PreferredMetadataLanguage":"en"}' \
+		"$URL/emby/Startup/Configuration" >/dev/null || fail "startup configuration failed"
+	curl -fsS --max-time 10 -X POST -H "$json" -d "{\"Name\":\"$USER_NAME\",\"Password\":\"$USER_PASS\"}" \
+		"$URL/emby/Startup/User" >/dev/null || fail "startup user failed"
+	curl -fsS --max-time 10 -X POST "$URL/emby/Startup/Complete" >/dev/null || fail "startup complete failed"
+
+	tok=$(curl -fsS --max-time 10 -X POST -H "$json" -H "X-Emby-Authorization: $AUTH" \
+		-d "{\"Username\":\"$USER_NAME\",\"Pw\":\"$USER_PASS\"}" "$URL/emby/Users/AuthenticateByName" | jq -r .AccessToken)
+	[ -n "$tok" ] && [ "$tok" != null ] || fail "login as $USER_NAME failed"
+	save token "$tok"
+	save user_id "$(api GET /Users | jq -r --arg n "$USER_NAME" '.[] | select(.Name == $n) | .Id')"
+
+	# Music library on the read-only mount; refreshLibrary starts the scan, which also imports the .m3u.
+	api POST '/Library/VirtualFolders?name=Music&collectionType=music&refreshLibrary=true' -H "$json" \
+		-d '{"LibraryOptions":{"PathInfos":[{"Path":"/music"}]}}' >/dev/null || fail "adding the music library failed"
+	wait_for 90 ready || fail "library scan did not finish within 90s"
+	log "ready in $(($(date +%s) - t0))s: $(lib_albums) albums, $(lib_tracks) tracks, playlist '$PLAYLIST' ($(load playlist_id))"
+
+	cat <<EOF
+[emby]
+url = "$URL"
+user = "$USER_NAME"
+password = "$USER_PASS"
+EOF
+}
+
+srv_status() {
+	local v
+	v=$(curl -fs --max-time 5 "$URL/emby/System/Info/Public" | jq -r .Version) || fail "no answer at $URL/emby"
+	echo "emby $v at $URL (login $USER_NAME / $USER_PASS, token in $STATE/token)"
+}
+
+srv_main "$@"

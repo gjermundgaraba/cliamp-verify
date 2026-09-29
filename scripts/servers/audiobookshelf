@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# audiobookshelf: disposable Audiobookshelf server for one vc run (contract: scripts/servers/lib.sh).
+# Libraries: "Audiobooks" (library/audiobooks: Verify Author / Verify Book, 2 chapter files)
+# and "Podcasts" (library/podcasts: Verify Show, 2 episodes).
+# Login: root / verify-pass. cliamp gets an API key (token); VC_ABS_AUTH=password configures
+# user + password instead, which exercises cliamp's login path.
+# shellcheck source=SCRIPTDIR/lib.sh
+source "$(dirname "$0")/lib.sh"
+
+IMAGE=ghcr.io/advplyr/audiobookshelf:2.37.0
+USER_NAME=root
+PASSWORD=verify-pass
+
+# api METHOD PATH [JSON]: authenticated call with the root session token.
+api() {
+	local args=(-fsS --max-time 10 -X "$1" -H "Authorization: Bearer $(load session)")
+	[ $# -ge 3 ] && args+=(-H 'Content-Type: application/json' -d "$3")
+	curl "${args[@]}" "$URL$2"
+}
+
+# library NAME MEDIATYPE FOLDER ICON PROVIDER: create, scan, and wait for one item; saves lib-<NAME>.
+library() {
+	local id
+	id=$(api POST /api/libraries "{\"name\":\"$1\",\"folders\":[{\"fullPath\":\"$3\"}],\"mediaType\":\"$2\",\"icon\":\"$4\",\"provider\":\"$5\"}" | jq -r .id)
+	[ -n "$id" ] && [ "$id" != null ] || fail "creating library $1 failed"
+	save "lib-$1" "$id"
+	api POST "/api/libraries/$id/scan" >/dev/null
+	wait_for 60 has_items "$id" || fail "library $1 has no items after 60s of scanning"
+}
+has_items() { [ "$(api GET "/api/libraries/$1/items" | jq .total)" -ge 1 ]; }
+
+srv_up() {
+	ctr_run 80 -v "$LIB/audiobooks:/audiobooks:ro" -v "$LIB/podcasts:/podcasts:ro"
+	wait_http "$URL/status" 90 || fail "no answer on $URL/status after 90s; see: vc srv RUN audiobookshelf logs"
+
+	curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' \
+		-d "{\"newRoot\":{\"username\":\"$USER_NAME\",\"password\":\"$PASSWORD\"}}" "$URL/init" >/dev/null ||
+		fail "POST /init failed"
+	save session "$(curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' -H 'x-return-tokens: true' \
+		-d "{\"username\":\"$USER_NAME\",\"password\":\"$PASSWORD\"}" "$URL/login" | jq -r .user.accessToken)"
+	[ "$(load session)" != null ] || fail "POST /login returned no access token"
+	save user-id "$(api GET /api/me | jq -r .id)"
+
+	library Audiobooks book /audiobooks audiobookshelf google
+	library Podcasts podcast /podcasts podcast itunes
+	save book-id "$(api GET "/api/libraries/$(load lib-Audiobooks)/items" | jq -r '.results[0].id')"
+	save show-id "$(api GET "/api/libraries/$(load lib-Podcasts)/items" | jq -r '.results[0].id')"
+
+	save token "$(api POST /api/api-keys "{\"name\":\"vc-$ID\",\"userId\":\"$(load user-id)\",\"isActive\":true}" | jq -r .apiKey.apiKey)"
+	[ "$(load token)" != null ] || fail "creating an API key failed"
+	log "ready: $URL (books: $(load book-id), podcasts: $(load show-id))"
+
+	printf '[audiobookshelf]\nurl = "%s"\n' "$URL"
+	if [ "${VC_ABS_AUTH:-token}" = password ]; then
+		printf 'user = "%s"\npassword = "%s"\n' "$USER_NAME" "$PASSWORD"
+	else
+		printf 'token = "%s"\n' "$(load token)"
+	fi
+}
+
+srv_status() {
+	curl -fsS --max-time 5 -H "Authorization: Bearer $(load token)" "$URL/api/me" >/dev/null ||
+		fail "$URL is not answering /api/me"
+	echo "$URL user=$USER_NAME password=$PASSWORD book=$(load book-id) show=$(load show-id)"
+}
+
+srv_main "$@"

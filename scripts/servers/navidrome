@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# navidrome: a disposable Navidrome server on the fixture library (contract: see lib.sh).
+# Bootstrap: first-user API creates the admin, a full Subsonic scan indexes the library and
+# imports the playlist's .m3u (owned by the admin), then the [navidrome] block is printed.
+# shellcheck source=SCRIPTDIR/lib.sh
+source "$(dirname "$0")/lib.sh"
+
+IMAGE=deluan/navidrome:0.64.2
+USER_NAME=verify
+
+# sub ENDPOINT [QUERY]: call the Subsonic API as the run's admin; prints the JSON response.
+sub() {
+	curl -fsS --max-time 10 "$URL/rest/$1?u=$USER_NAME&p=$(load password)&v=1.16.1&c=vc&f=json${2:+&$2}"
+}
+sub_ok() { sub "$@" | jq -e '."subsonic-response".status == "ok"' >/dev/null; }
+
+scan_done() {
+	sub getScanStatus | jq -e --argjson n "$(lib_tracks)" '."subsonic-response".scanStatus | .scanning == false and .count >= $n' >/dev/null
+}
+playlist_ready() {
+	sub getPlaylists | jq -e --arg name "$PLAYLIST" --argjson n "$(lib_playlist | jq length)" \
+		'[."subsonic-response".playlists.playlist[]? | select(.name == $name and .songCount == $n)] | length == 1' >/dev/null
+}
+
+srv_up() {
+	local pass songs
+	pass=vc-$(openssl rand -hex 6)
+	save password "$pass"
+	# No periodic scans, and no calls to external services (insights, Last.fm, ListenBrainz, Spotify).
+	ctr_run 4533 -v "$LIB/music:/music:ro" \
+		-e ND_SCANSCHEDULE=0 -e ND_ENABLEINSIGHTSCOLLECTOR=false -e ND_ENABLEEXTERNALSERVICES=false \
+		-e ND_LASTFM_ENABLED=false -e ND_LISTENBRAINZ_ENABLED=false -e ND_LOGLEVEL=info
+	wait_http "$URL/ping" 60 || fail "no answer on $URL/ping within 60s; see: vc srv RUN navidrome logs"
+	curl -fsS --max-time 10 -H 'Content-Type: application/json' \
+		-d "{\"username\":\"$USER_NAME\",\"password\":\"$pass\"}" "$URL/auth/createAdmin" >/dev/null ||
+		fail "createAdmin failed"
+	# The startup scan may run before the admin exists, and playlists are only imported with an
+	# admin. A full scan after createAdmin imports the .m3u.
+	wait_for 30 sub_ok startScan fullScan=true || fail "startScan failed"
+	wait_for 60 scan_done || fail "scan did not finish within 60s"
+	songs=$(sub getScanStatus | jq -r '."subsonic-response".scanStatus.count')
+	wait_for 20 playlist_ready || fail "$PLAYLIST was not imported"
+	log "ready: $songs songs, playlist imported"
+	printf '[navidrome]\nurl = "%s"\nuser = "%s"\npassword = "%s"\n' "$URL" "$USER_NAME" "$pass"
+}
+
+srv_status() {
+	sub_ok ping || fail "$URL does not answer Subsonic ping"
+	echo "url=$URL user=$USER_NAME password=$(load password)"
+}
+
+srv_main "$@"

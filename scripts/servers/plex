@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# plex: a disposable, UNCLAIMED Plex Media Server for one verification run. No plex.tv account.
+# The server is never claimed. allowedNetworks=0.0.0.0/0 lets every client in without a token, and
+# the port is published on 127.0.0.1 only, so "every client" means this machine. PMS then ignores
+# X-Plex-Token, and cliamp gets a dummy one, because [plex] needs a non-empty token.
+# See scripts/servers/lib.sh for the contract.
+# shellcheck source=SCRIPTDIR/lib.sh
+source "$(dirname "$0")/lib.sh"
+
+IMAGE=plexinc/pms-docker:1.43.4.10903-e5521bd8c
+TOKEN=vc-unclaimed-no-token-needed
+
+api() { curl -fsS --max-time 10 -H 'Accept: application/json' "$@"; }
+
+# started: /identity drops its startState attribute once PMS finished starting.
+started() {
+	local id
+	id=$(curl -fsS --max-time 3 "$URL/identity") && [[ $id == *machineIdentifier* && $id != *startState* ]]
+}
+
+# tracks_indexed N: the Music section (key 1) holds N tracks and is not refreshing.
+tracks_indexed() {
+	[ "$(api "$URL/library/sections/1/all?type=10" | jq -r '.MediaContainer.size')" = "$1" ] &&
+		[ "$(api "$URL/library/sections" | jq -r '.MediaContainer.Directory[0].refreshing')" = false ]
+}
+
+srv_up() {
+	local want mid keys uri
+	# /config and /transcode are anonymous volumes, so down (rm -v) removes the server's state.
+	ctr_run 32400 -e TZ=UTC -e ALLOWED_NETWORKS=0.0.0.0/0 -v "$LIB/music:/music:ro"
+	wait_for 240 started || fail "PMS did not finish starting within 240s; see: vc srv RUN plex logs"
+	api -X POST -o /dev/null "$URL/library/sections?name=Music&type=artist&agent=tv.plex.agents.music&scanner=Plex%20Music&language=en-US&location=%2Fmusic" ||
+		fail "creating the Music library failed"
+	want=$(lib_tracks)
+	log "scanning $want tracks"
+	wait_for 120 tracks_indexed "$want" || fail "scan did not index $want tracks within 120s"
+	# Plex doesn't import .m3u files from a library folder, so build the playlist from the file's titles.
+	mid=$(api "$URL/identity" | jq -r .MediaContainer.machineIdentifier)
+	keys=$(api "$URL/library/sections/1/all?type=10" |
+		jq -c --argjson want "$(lib_playlist)" '[$want[] as $t | .MediaContainer.Metadata[] | select(.title == $t) | .ratingKey]')
+	[ "$(jq length <<<"$keys")" = "$(lib_playlist | jq length)" ] || fail "not every $PLAYLIST track is in the library"
+	uri=$(printf 'server://%s/com.plexapp.plugins.library/library/metadata/%s' "$mid" "$(jq -r 'join(",")' <<<"$keys")" | jq -sRr @uri)
+	api -X POST -o /dev/null "$URL/playlists?type=audio&title=$(printf %s "$PLAYLIST" | jq -sRr @uri)&smart=0&uri=$uri" ||
+		fail "creating $PLAYLIST failed"
+	log "ready: $URL (unclaimed; library Music, $want tracks, $(lib_albums) albums, playlist $PLAYLIST)"
+	printf '[plex]\nurl = "%s"\ntoken = "%s"\n' "$URL" "$TOKEN"
+}
+
+srv_status() {
+	local v
+	v=$(api "$URL/identity" | jq -r .MediaContainer.version) || fail "$URL not answering"
+	echo "$URL unclaimed PMS $v, no login (allowedNetworks), token ignored"
+}
+
+srv_logs() {
+	ctr_logs
+	docker exec "$CTR" sh -c 'cat "/config/Library/Application Support/Plex Media Server/Logs/Plex Media Server.log"' 2>/dev/null || true
+}
+
+srv_main "$@"
