@@ -17,7 +17,7 @@ Unit tests don't show that a keybinding does the right thing on screen, or that 
 Beyond local playback:
 - **Media servers.** `vc up --server NAME` starts a disposable Navidrome, Jellyfin, Emby, Plex, Audiobookshelf or Lyrion server in Docker. It serves a generated test library and has a throwaway login.
 - **Spotify.** Uses a separate sign-in kept in `~/.config/cliamp-verify/`. The agent plays anything or changes your library only when you say so.
-- **Linux.** Runs on a disposable [clankerbox](https://github.com/gjermundgaraba/clankerbox) microVM, using the profile in `clankerbox-profile/`. See `clankerbox.md`.
+- **Linux.** Runs on a disposable [clankerbox](https://github.com/gjermundgaraba/clankerbox) microVM, using the `cliamp-dev.json` profile and its recipe in `clankerbox-profile/`. See `clankerbox.md`.
 
 ## Requirements
 
@@ -41,7 +41,7 @@ The skill runs only when you ask for it: `/verify-cliamp` in Claude Code, `$veri
 - `scripts/vc`: the run helper (`up`, `keys`, `screen`, `state`, `cli`, `doctor`, `down`, ...)
 - `features/`: one verification recipe per cliamp feature, plus known bugs found along the way
 - `scripts/servers/`, `scripts/make-library`: the disposable media servers and their test library
-- `clankerbox.md`, `clankerbox-profile/`, `scripts/clankerbox-docker`: Linux runs on clankerbox
+- `clankerbox.md`, `cliamp-dev.json`, `clankerbox-profile/`, `scripts/clankerbox-docker`: Linux runs on clankerbox
 - `agents/openai.yaml`: Codex metadata (user-invoked only)
 
 ## License

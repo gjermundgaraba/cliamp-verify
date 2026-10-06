@@ -1,0 +1,7 @@
+{
+  "base": "ubuntu",
+  "cpu": 2,
+  "ramMib": 1024,
+  "diskGib": 20,
+  "setup": { "path": "clankerbox-profile", "timeoutSeconds": 600 }
+}

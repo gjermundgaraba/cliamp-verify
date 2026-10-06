@@ -7,7 +7,9 @@
 # Three fixes over starting the daemons by hand:
 # - The root filesystem is an overlay, and overlay-on-overlay fails ("fstype: overlay ... invalid
 #   argument"). Docker and containerd get a loop-mounted ext4 image instead.
-# - Box shells run with umask 0077, so daemons started from them write image layers as 0700 and every
+#   The guest's /dev is a tmpfs without loop device nodes, though the kernel has the driver:
+#   the script makes them, on every boot.
+# - A shell with umask 0077 makes daemons started from it write image layers as 0700, and every
 #   non-root process in a container gets "Permission denied". The daemons start with umask 022.
 # - A machine stop doesn't flush the loop image, so a container or volume removed just before it
 #   can come back after the start. No vc run survives a stop, so leftovers are deleted: vc
@@ -24,6 +26,8 @@ command -v dockerd >/dev/null || { echo "clankerbox-docker: no dockerd; use the 
 
 IMG=/srv-containers.img
 if ! mountpoint -q /var/lib/docker; then
+	[ -e /dev/loop-control ] || mknod -m 660 /dev/loop-control c 10 237
+	for i in 0 1 2 3 4 5 6 7; do [ -e /dev/loop$i ] || mknod -m 660 /dev/loop$i b 7 $i; done
 	[ -f $IMG ] || { truncate -s 6G $IMG && mkfs.ext4 -q -F $IMG; }
 	mkdir -p /mnt/ctr
 	mountpoint -q /mnt/ctr || mount -o loop $IMG /mnt/ctr

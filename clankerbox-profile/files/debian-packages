@@ -1,6 +1,7 @@
 ca-certificates
 git
 gcc
+libc6-dev
 golang-go
 perl
 pkg-config
